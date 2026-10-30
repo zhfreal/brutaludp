@@ -16,11 +16,14 @@ const (
 
 // PacedPacketConn wraps net.PacketConn to meter raw UDP datagrams without head-of-line blocking.
 type PacedPacketConn struct {
-	droppedPackets atomic.Uint64 // 64-bit atomic placed first for guaranteed 8-byte alignment on 32-bit platforms
+	// 8-byte aligned 64-bit atomics placed first for guaranteed alignment on 32-bit platforms
+	droppedPackets        atomic.Uint64
+	minSleepThresholdNano atomic.Int64 // Micro-burst smoothing threshold in nanoseconds
+
 	net.PacketConn
-	group          *Group
-	closeOnce      sync.Once
-	closed         atomic.Bool
+	group     *Group
+	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
 // DroppedPackets returns the total count of datagrams tail-dropped due to pacer forward horizon saturation.
@@ -28,11 +31,30 @@ func (c *PacedPacketConn) DroppedPackets() uint64 {
 	return c.droppedPackets.Load()
 }
 
+// SetMinSleepThreshold configures the minimum delay before sleeping, smoothing micro-bursts without scheduler churn.
+func (c *PacedPacketConn) SetMinSleepThreshold(d time.Duration) {
+	if d <= 0 {
+		d = MinSleepThreshold
+	}
+	c.minSleepThresholdNano.Store(int64(d))
+}
+
+// MinSleepThreshold returns the effective minimum sleep threshold.
+func (c *PacedPacketConn) MinSleepThreshold() time.Duration {
+	d := c.minSleepThresholdNano.Load()
+	if d <= 0 {
+		return MinSleepThreshold
+	}
+	return time.Duration(d)
+}
+
 func NewPacedPacketConn(conn net.PacketConn, group *Group) *PacedPacketConn {
-	return &PacedPacketConn{
+	c := &PacedPacketConn{
 		PacketConn: conn,
 		group:      group,
 	}
+	c.minSleepThresholdNano.Store(int64(MinSleepThreshold))
+	return c
 }
 
 // Upstream exposes the underlying wrapped PacketConn for transparent wrapper inspection.
@@ -114,7 +136,8 @@ func (c *PacedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 			c.droppedPackets.Add(1)
 			return len(p), nil
 		}
-		if delay >= MinSleepThreshold {
+		minSleep := c.MinSleepThreshold()
+		if delay >= minSleep {
 			if c.closed.Load() {
 				return 0, net.ErrClosed
 			}
@@ -142,7 +165,8 @@ func (c *PacedPacketConn) Write(p []byte) (int, error) {
 				c.droppedPackets.Add(1)
 				return len(p), nil
 			}
-			if delay >= MinSleepThreshold {
+			minSleep := c.MinSleepThreshold()
+			if delay >= minSleep {
 				if c.closed.Load() {
 					return 0, net.ErrClosed
 				}

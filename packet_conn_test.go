@@ -170,3 +170,16 @@ func TestPacedPacketConnUnwrapAndAlignment(t *testing.T) {
 		t.Fatalf("expected DroppedPackets() = 42, got %d", conn.DroppedPackets())
 	}
 }
+
+func TestPacedPacketConnTunableSleepThreshold(t *testing.T) {
+	conn := NewPacedPacketConn(&mockPacketConn{}, nil)
+	defer conn.Close()
+
+	if conn.MinSleepThreshold() != MinSleepThreshold {
+		t.Fatalf("expected default min sleep %v, got %v", MinSleepThreshold, conn.MinSleepThreshold())
+	}
+	conn.SetMinSleepThreshold(5 * time.Millisecond)
+	if conn.MinSleepThreshold() != 5*time.Millisecond {
+		t.Fatalf("expected updated min sleep 5ms, got %v", conn.MinSleepThreshold())
+	}
+}

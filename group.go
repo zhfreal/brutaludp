@@ -55,6 +55,8 @@ type Group struct {
 	sentBytes      atomic.Uint64
 	lastActiveNano atomic.Int64  // Last transmission activity timestamp for idle sweeping
 	rate           atomic.Uint64 // Configured bytes per second (thread-safe lock-free reads)
+	maxLagNano     atomic.Int64  // Maximum burst lag credit clamp in nanoseconds (lock-free)
+	maxHorizonNano atomic.Int64  // Maximum forward scheduling horizon clamp in nanoseconds (lock-free)
 	ID             uint64
 	Rate           uint64        // Configured bytes per second (cached field for compatibility)
 
@@ -93,6 +95,19 @@ func NewGroup(id uint64, rateBytesPerSec uint64, cwndGain uint32, manager *Group
 	g.effectiveRate.Store(rateBytesPerSec)
 	g.nextTimeNano.Store(nowNano)
 	g.lastActiveNano.Store(nowNano)
+
+	maxLag := int64(GroupMaxLag)
+	maxHorizon := int64(GroupMaxHorizon)
+	if manager != nil {
+		if mLag := manager.defaultMaxLag.Load(); mLag > 0 {
+			maxLag = mLag
+		}
+		if mHorizon := manager.defaultMaxHorizon.Load(); mHorizon > 0 {
+			maxHorizon = mHorizon
+		}
+	}
+	g.maxLagNano.Store(maxLag)
+	g.maxHorizonNano.Store(maxHorizon)
 	return g
 }
 
@@ -157,6 +172,40 @@ func (g *Group) SetCwndGain(gain uint32) {
 		gain = DefaultCwndGain
 	}
 	g.CwndGain.Store(gain)
+}
+
+// SetMaxLag sets the maximum burst lag credit clamp for this group.
+func (g *Group) SetMaxLag(lag time.Duration) {
+	if lag <= 0 {
+		lag = GroupMaxLag
+	}
+	g.maxLagNano.Store(int64(lag))
+}
+
+// MaxLag returns the configured maximum burst lag credit clamp.
+func (g *Group) MaxLag() time.Duration {
+	lag := g.maxLagNano.Load()
+	if lag <= 0 {
+		return GroupMaxLag
+	}
+	return time.Duration(lag)
+}
+
+// SetMaxHorizon sets the maximum forward scheduling horizon clamp for this group.
+func (g *Group) SetMaxHorizon(horizon time.Duration) {
+	if horizon <= 0 {
+		horizon = GroupMaxHorizon
+	}
+	g.maxHorizonNano.Store(int64(horizon))
+}
+
+// MaxHorizon returns the configured maximum forward scheduling horizon clamp.
+func (g *Group) MaxHorizon() time.Duration {
+	horizon := g.maxHorizonNano.Load()
+	if horizon <= 0 {
+		return GroupMaxHorizon
+	}
+	return time.Duration(horizon)
 }
 
 // SetDisableLossCompensation thread-safely toggles loss compensation.
@@ -225,8 +274,16 @@ func (g *Group) Reserve(nowNano int64, bytes int) (delay time.Duration, ok bool)
 		effBps = BrutalMinRate
 	}
 	burstDuration := (int64(bytes) * NanosPerSecond) / int64(effBps)
-	minStart := nowNano - int64(GroupMaxLag)
-	maxStart := nowNano + int64(GroupMaxHorizon)
+	lag := g.maxLagNano.Load()
+	if lag <= 0 {
+		lag = int64(GroupMaxLag)
+	}
+	horizon := g.maxHorizonNano.Load()
+	if horizon <= 0 {
+		horizon = int64(GroupMaxHorizon)
+	}
+	minStart := nowNano - lag
+	maxStart := nowNano + horizon
 
 	for {
 		cur := g.nextTimeNano.Load()
@@ -274,7 +331,11 @@ func (g *Group) OnPacketSent(now time.Time, bytes int) {
 	} else {
 		nowNano = monotonicNano()
 	}
-	minStartNano := nowNano - int64(GroupMaxLag)
+	lag := g.maxLagNano.Load()
+	if lag <= 0 {
+		lag = int64(GroupMaxLag)
+	}
+	minStartNano := nowNano - lag
 
 	for {
 		curNext := g.nextTimeNano.Load()
@@ -356,6 +417,8 @@ type GroupManager struct {
 	janitorDone            chan struct{}
 	maxGroups              int
 	idleTTL                time.Duration
+	defaultMaxLag          atomic.Int64
+	defaultMaxHorizon      atomic.Int64
 }
 
 // SetMaxGroups sets the maximum number of concurrent groups allowed before emergency cleanup.
@@ -370,6 +433,22 @@ func (m *GroupManager) SetIdleTTL(ttl time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.idleTTL = ttl
+}
+
+// SetDefaultMaxLag sets the default maximum burst lag for groups created by this manager.
+func (m *GroupManager) SetDefaultMaxLag(lag time.Duration) {
+	if lag <= 0 {
+		lag = GroupMaxLag
+	}
+	m.defaultMaxLag.Store(int64(lag))
+}
+
+// SetDefaultMaxHorizon sets the default forward horizon for groups created by this manager.
+func (m *GroupManager) SetDefaultMaxHorizon(horizon time.Duration) {
+	if horizon <= 0 {
+		horizon = GroupMaxHorizon
+	}
+	m.defaultMaxHorizon.Store(int64(horizon))
 }
 
 var DefaultManager = &GroupManager{

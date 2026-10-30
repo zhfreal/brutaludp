@@ -221,3 +221,29 @@ func TestGroupAlignment32Bit(t *testing.T) {
 		t.Fatal("atomic load value mismatch")
 	}
 }
+
+func TestGroupTunableLagAndHorizon(t *testing.T) {
+	manager := NewGroupManager()
+	defer manager.Close()
+
+	manager.SetDefaultMaxLag(10 * time.Millisecond)
+	manager.SetDefaultMaxHorizon(250 * time.Millisecond)
+
+	g := manager.GetOrCreate(201, 10*1024*1024)
+	if g.MaxLag() != 10*time.Millisecond {
+		t.Fatalf("expected MaxLag 10ms, got %v", g.MaxLag())
+	}
+	if g.MaxHorizon() != 250*time.Millisecond {
+		t.Fatalf("expected MaxHorizon 250ms, got %v", g.MaxHorizon())
+	}
+
+	// Update per-group
+	g.SetMaxLag(5 * time.Millisecond)
+	g.SetMaxHorizon(50 * time.Millisecond)
+	if g.MaxLag() != 5*time.Millisecond {
+		t.Fatalf("expected updated MaxLag 5ms, got %v", g.MaxLag())
+	}
+	if g.MaxHorizon() != 50*time.Millisecond {
+		t.Fatalf("expected updated MaxHorizon 50ms, got %v", g.MaxHorizon())
+	}
+}
