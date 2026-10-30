@@ -82,3 +82,4 @@ Key design features include:
 | `group_test.go` | Test Suite | Unit tests for virtual clock accuracy, burst limits, forward horizon tail drops, 32-bit atomic alignment, concurrency stress, and tunable lag/horizon verification. |
 | `packet_conn.go` | Network Wrapper | `PacedPacketConn` wrapping `net.PacketConn`, micro-burst smoothing, tail-drop telemetry, user-tunable sleep threshold, and comprehensive nil/closed error guards. |
 | `packet_conn_test.go` | Test Suite | Unit tests for packet pacing, micro-bursts, tail drops, concurrent close safety, and tunable sleep thresholds. |
+
