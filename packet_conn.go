@@ -51,6 +51,13 @@ func (c *PacedPacketConn) SyscallConn() (syscall.RawConn, error) {
 	return nil, syscall.EINVAL
 }
 
+func (c *PacedPacketConn) LocalAddr() net.Addr {
+	if c.PacketConn == nil {
+		return nil
+	}
+	return c.PacketConn.LocalAddr()
+}
+
 func (c *PacedPacketConn) RemoteAddr() net.Addr {
 	if c.PacketConn == nil {
 		return nil
@@ -59,6 +66,36 @@ func (c *PacedPacketConn) RemoteAddr() net.Addr {
 		return r.RemoteAddr()
 	}
 	return nil
+}
+
+func (c *PacedPacketConn) SetDeadline(t time.Time) error {
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	if c.PacketConn == nil {
+		return net.ErrClosed
+	}
+	return c.PacketConn.SetDeadline(t)
+}
+
+func (c *PacedPacketConn) SetReadDeadline(t time.Time) error {
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	if c.PacketConn == nil {
+		return net.ErrClosed
+	}
+	return c.PacketConn.SetReadDeadline(t)
+}
+
+func (c *PacedPacketConn) SetWriteDeadline(t time.Time) error {
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	if c.PacketConn == nil {
+		return net.ErrClosed
+	}
+	return c.PacketConn.SetWriteDeadline(t)
 }
 
 func (c *PacedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
@@ -131,6 +168,16 @@ func (c *PacedPacketConn) Read(p []byte) (int, error) {
 		return r.Read(p)
 	}
 	return 0, syscall.EINVAL
+}
+
+func (c *PacedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	if c.closed.Load() {
+		return 0, nil, net.ErrClosed
+	}
+	if c.PacketConn == nil {
+		return 0, nil, net.ErrClosed
+	}
+	return c.PacketConn.ReadFrom(p)
 }
 
 func (c *PacedPacketConn) Close() error {

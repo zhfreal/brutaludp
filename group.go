@@ -7,16 +7,22 @@ import (
 )
 
 const (
-	GroupMaxLag               = 2 * time.Millisecond   // Equivalent to kernel GROUP_MAX_LAG_NS
-	GroupMaxHorizon           = 100 * time.Millisecond // Bounded forward scheduling horizon (anti-OOM backpressure)
-	MinAckRate                = 0.80                   // Equivalent to kernel MIN_ACK_RATE_PERCENT (max 1.25x boost)
-	BrutalMinRate             = 64 * 1024              // 64 KB/s floor
-	MinFeedbackSlots          = 50                     // Minimum sample count before loss compensation adapts
-	PktInfoSlots              = 4                      // Kernel-identical 4-second epoch slots
-	MaxGroups                 = 32768                  // Maximum concurrent groups ceiling (prevents OOM DoS attacks)
-	DefaultIdleTTL            = 30 * time.Second       // Retention TTL for unreferenced groups before eviction
-	EmergencySweepMinInterval = 200 * time.Millisecond // Minimum interval between emergency capacity sweeps (DoS protection)
-	MaxSafePacketBytes        = 64 * 1024 * 1024       // 64 MB clamp preventing int64 integer overflow in burst math
+	GroupMaxLag                   = 2 * time.Millisecond   // Equivalent to kernel GROUP_MAX_LAG_NS
+	GroupMaxHorizon               = 100 * time.Millisecond // Bounded forward scheduling horizon (anti-OOM backpressure)
+	MinAckRate                    = 0.80                   // Equivalent to kernel MIN_ACK_RATE_PERCENT (max 1.25x boost)
+	BrutalMinRate                 = 64 * 1024              // 64 KB/s floor
+	MinFeedbackSlots              = 50                     // Minimum sample count before loss compensation adapts
+	PktInfoSlots                  = 4                      // Kernel-identical 4-second epoch slots
+	MaxGroups                     = 32768                  // Maximum concurrent groups ceiling (prevents OOM DoS attacks)
+	DefaultIdleTTL                = 30 * time.Second       // Retention TTL for unreferenced groups before eviction
+	EmergencySweepMinInterval     = 200 * time.Millisecond // Minimum interval between emergency capacity sweeps (DoS protection)
+	MaxSafePacketBytes            = 64 * 1024 * 1024       // 64 MB clamp preventing int64 integer overflow in burst math
+	DefaultCwndGain               = 20                     // Default CWND gain in tenths (2.0x)
+	DefaultJanitorInterval        = 10 * time.Second       // Default background reaping interval
+	MinMapCompactDeletedThreshold = 512                    // Minimum deleted group count before evaluating map compaction
+	MapCompactRatioThreshold      = 2                      // Ratio threshold (deleted * ratio >= total) for map compaction
+	NanosPerSecond                = 1_000_000_000          // Nanoseconds per second for time conversions
+	DefaultAckRate                = 1.0                    // Baseline ACK rate (100%) when sample count is insufficient
 )
 
 // DirectionDownlinkFlag partitions group IDs directionally on bit 63 to isolate uplink/downlink pools.
@@ -71,14 +77,14 @@ func NewGroup(id uint64, rateBytesPerSec uint64, cwndGain uint32, manager *Group
 		rateBytesPerSec = BrutalMinRate
 	}
 	if cwndGain == 0 {
-		cwndGain = 20
+		cwndGain = DefaultCwndGain
 	}
 	nowNano := monotonicNano()
 	g := &Group{
 		ID:         id,
 		Rate:       rateBytesPerSec,
 		manager:    manager,
-		ackRate:    1.0,
+		ackRate:    DefaultAckRate,
 		lastUpdate: nowNano,
 	}
 	g.rate.Store(rateBytesPerSec)
@@ -148,7 +154,7 @@ func (g *Group) SetRate(rateBytesPerSec uint64) {
 // SetCwndGain locklessly updates the configured CWND gain factor.
 func (g *Group) SetCwndGain(gain uint32) {
 	if gain == 0 {
-		gain = 20
+		gain = DefaultCwndGain
 	}
 	g.CwndGain.Store(gain)
 }
@@ -218,7 +224,7 @@ func (g *Group) Reserve(nowNano int64, bytes int) (delay time.Duration, ok bool)
 	if effBps < BrutalMinRate {
 		effBps = BrutalMinRate
 	}
-	burstDuration := (int64(bytes) * 1_000_000_000) / int64(effBps)
+	burstDuration := (int64(bytes) * NanosPerSecond) / int64(effBps)
 	minStart := nowNano - int64(GroupMaxLag)
 	maxStart := nowNano + int64(GroupMaxHorizon)
 
@@ -261,7 +267,7 @@ func (g *Group) OnPacketSent(now time.Time, bytes int) {
 	if effBps < BrutalMinRate {
 		effBps = BrutalMinRate
 	}
-	burstDuration := (int64(bytes) * 1_000_000_000) / int64(effBps)
+	burstDuration := (int64(bytes) * NanosPerSecond) / int64(effBps)
 	var nowNano int64
 	if !now.IsZero() {
 		nowNano = now.Sub(startTime).Nanoseconds()
@@ -297,7 +303,7 @@ func (g *Group) RecordFeedback(acked, lost uint64) {
 		return
 	}
 
-	sec := monotonicNano() / 1_000_000_000
+	sec := monotonicNano() / NanosPerSecond
 	slotIdx := sec & (PktInfoSlots - 1)
 
 	if g.slots[slotIdx].sec == sec {
@@ -318,10 +324,10 @@ func (g *Group) RecordFeedback(acked, lost uint64) {
 	}
 	total := totalAcked + totalLost
 	if total < MinFeedbackSlots {
-		if g.ackRate == 1.0 {
+		if g.ackRate == DefaultAckRate {
 			return
 		}
-		g.ackRate = 1.0
+		g.ackRate = DefaultAckRate
 	} else {
 		rate := float64(totalAcked) / float64(total)
 		if rate < MinAckRate {
@@ -348,6 +354,22 @@ type GroupManager struct {
 	lastEmergencySweepNano int64
 	janitorRunning         atomic.Bool
 	janitorDone            chan struct{}
+	maxGroups              int
+	idleTTL                time.Duration
+}
+
+// SetMaxGroups sets the maximum number of concurrent groups allowed before emergency cleanup.
+func (m *GroupManager) SetMaxGroups(max int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.maxGroups = max
+}
+
+// SetIdleTTL sets the retention TTL for unreferenced groups before eviction.
+func (m *GroupManager) SetIdleTTL(ttl time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.idleTTL = ttl
 }
 
 var DefaultManager = &GroupManager{
@@ -384,7 +406,7 @@ func (m *GroupManager) cleanupIdleLocked(idleLimit int64) int {
 		if len(m.groups) == 0 {
 			m.groups = make(map[uint64]*Group)
 			m.deletedCount = 0
-		} else if m.deletedCount >= 512 && (m.deletedCount*2 >= len(m.groups)) {
+		} else if m.deletedCount >= MinMapCompactDeletedThreshold && (m.deletedCount*MapCompactRatioThreshold >= len(m.groups)) {
 			m.compactLocked()
 		}
 	}
@@ -397,10 +419,14 @@ func (m *GroupManager) GetOrCreate(id uint64, rate uint64, cwndGain ...uint32) *
 	}
 	// Lazily initialize background janitor on first group creation (fast lock-free check)
 	if !m.janitorRunning.Load() {
-		m.StartJanitor(10*time.Second, DefaultIdleTTL)
+		idleTTL := m.idleTTL
+		if idleTTL <= 0 {
+			idleTTL = DefaultIdleTTL
+		}
+		m.StartJanitor(DefaultJanitorInterval, idleTTL)
 	}
 
-	gain := uint32(20)
+	gain := uint32(DefaultCwndGain)
 	if len(cwndGain) > 0 && cwndGain[0] > 0 {
 		gain = cwndGain[0]
 	}
@@ -420,13 +446,17 @@ func (m *GroupManager) GetOrCreate(id uint64, rate uint64, cwndGain ...uint32) *
 	}
 
 	// Capacity guardrail: prevent OOM from randomized group ID exhaustion
-	if len(m.groups) >= MaxGroups {
+	maxGroups := m.maxGroups
+	if maxGroups <= 0 {
+		maxGroups = MaxGroups
+	}
+	if len(m.groups) >= maxGroups {
 		nowNano := monotonicNano()
 		if nowNano-m.lastEmergencySweepNano >= int64(EmergencySweepMinInterval) {
 			m.lastEmergencySweepNano = nowNano
 			m.cleanupIdleLocked(0) // Throttled emergency sweep of unreferenced groups
 		}
-		if len(m.groups) >= MaxGroups {
+		if len(m.groups) >= maxGroups {
 			return nil // Refuse allocation to protect process memory (O(1) fast rejection under flood)
 		}
 	}
