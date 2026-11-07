@@ -46,6 +46,7 @@ Key design features include:
 * **Capacity Guardrails & DoS Protection (`GroupManager`)**:
   - Enforces maximum concurrent group ceilings (`MaxGroups = 32768`, tunable via `SetMaxGroups`).
   - Provides throttled emergency sweeps (`EmergencySweepMinInterval = 200ms`) and background idle reaping (`DefaultJanitorInterval = 10s`, `DefaultIdleTTL = 30s`, tunable via `SetIdleTTL`).
+  - Thread-safe lazy janitor startup: `GetOrCreate` triggers `StartJanitor` with fallback reading of `idleTTL` safely guarded under `m.mu.Lock()`, eliminating data races during concurrent group initialization.
   - Automatic hash map compaction (`compactLocked`) when tombstoned entries exceed thresholds (`MinMapCompactDeletedThreshold = 512`, `MapCompactRatioThreshold = 2`).
 
 ### 2.4 User-Space Datagram Pacer (`packet_conn.go`)

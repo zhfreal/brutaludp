@@ -247,3 +247,16 @@ func TestGroupTunableLagAndHorizon(t *testing.T) {
 		t.Fatalf("expected updated MaxHorizon 50ms, got %v", g.MaxHorizon())
 	}
 }
+
+func TestGroupManagerStartJanitorZeroDefaults(t *testing.T) {
+	manager := NewGroupManager()
+	defer manager.Close()
+
+	// Calling StartJanitor with 0 interval and 0 maxIdle should safely default without panic
+	manager.StartJanitor(0, 0)
+	g := manager.GetOrCreate(301, 10*1024*1024)
+	if g == nil {
+		t.Fatal("failed to create group")
+	}
+	manager.StopJanitor()
+}

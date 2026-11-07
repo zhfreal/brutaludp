@@ -498,11 +498,7 @@ func (m *GroupManager) GetOrCreate(id uint64, rate uint64, cwndGain ...uint32) *
 	}
 	// Lazily initialize background janitor on first group creation (fast lock-free check)
 	if !m.janitorRunning.Load() {
-		idleTTL := m.idleTTL
-		if idleTTL <= 0 {
-			idleTTL = DefaultIdleTTL
-		}
-		m.StartJanitor(DefaultJanitorInterval, idleTTL)
+		m.StartJanitor(DefaultJanitorInterval, 0)
 	}
 
 	gain := uint32(DefaultCwndGain)
@@ -576,6 +572,15 @@ func (m *GroupManager) StartJanitor(interval, maxIdle time.Duration) {
 	if m.janitorRunning.Load() {
 		m.mu.Unlock()
 		return
+	}
+	if interval <= 0 {
+		interval = DefaultJanitorInterval
+	}
+	if maxIdle <= 0 {
+		maxIdle = m.idleTTL
+		if maxIdle <= 0 {
+			maxIdle = DefaultIdleTTL
+		}
 	}
 	m.janitorRunning.Store(true)
 	done := make(chan struct{})
