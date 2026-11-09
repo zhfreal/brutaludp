@@ -183,3 +183,67 @@ func TestPacedPacketConnTunableSleepThreshold(t *testing.T) {
 		t.Fatalf("expected updated min sleep 5ms, got %v", conn.MinSleepThreshold())
 	}
 }
+
+func TestPacedPacketConnCloseWakesSleepingWriter(t *testing.T) {
+	mgr := NewGroupManager()
+	defer mgr.Close()
+
+	g := mgr.GetOrCreate(777, BrutalMinRate)
+	g.SetMaxHorizon(500 * time.Millisecond)
+	mock := &mockPacketConn{}
+	conn := NewPacedPacketConn(mock, g)
+
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9999}
+	// First burst consumes lag credit and schedules next departure ~200ms in the future
+	_, _ = conn.WriteTo(make([]byte, 16384), addr)
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := conn.WriteTo(make([]byte, 8192), addr)
+		done <- err
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	_ = conn.Close()
+
+	select {
+	case err := <-done:
+		if err != net.ErrClosed {
+			t.Fatalf("expected net.ErrClosed when closing during pacing sleep, got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+			t.Fatalf("Close() took too long to wake sleeping writer: %v", elapsed)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("WriteTo remained blocked after Close()")
+	}
+}
+
+func TestCancelReservationOnAbortedSleep(t *testing.T) {
+	mgr := NewGroupManager()
+	defer mgr.Close()
+
+	g := mgr.GetOrCreate(888, BrutalMinRate)
+	g.SetMaxHorizon(500 * time.Millisecond)
+	mock := &mockPacketConn{}
+	conn := NewPacedPacketConn(mock, g)
+
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9999}
+	_, _ = conn.WriteTo(make([]byte, 16384), addr)
+	sentBefore := g.SentBytes()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.WriteTo(make([]byte, 8192), addr)
+		done <- err
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	_ = conn.Close()
+	<-done
+
+	if g.SentBytes() != sentBefore {
+		t.Fatalf("expected aborted WriteTo reservation to be refunded: sentBefore=%d sentAfter=%d", sentBefore, g.SentBytes())
+	}
+}

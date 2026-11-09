@@ -4,6 +4,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestGroupVirtualClockRate(t *testing.T) {
@@ -259,4 +260,85 @@ func TestGroupManagerStartJanitorZeroDefaults(t *testing.T) {
 		t.Fatal("failed to create group")
 	}
 	manager.StopJanitor()
+}
+
+func TestGroupManagerAtomicAlignmentAndLen(t *testing.T) {
+	mgr := NewGroupManager(15 * time.Second)
+	defer mgr.Close()
+
+	if unsafe.Offsetof(mgr.defaultMaxLag)%8 != 0 {
+		t.Fatalf("GroupManager.defaultMaxLag offset %d is not 8-byte aligned", unsafe.Offsetof(mgr.defaultMaxLag))
+	}
+	if unsafe.Offsetof(mgr.defaultMaxHorizon)%8 != 0 {
+		t.Fatalf("GroupManager.defaultMaxHorizon offset %d is not 8-byte aligned", unsafe.Offsetof(mgr.defaultMaxHorizon))
+	}
+	if unsafe.Offsetof(mgr.lastEmergencySweepNano)%8 != 0 {
+		t.Fatalf("GroupManager.lastEmergencySweepNano offset %d is not 8-byte aligned", unsafe.Offsetof(mgr.lastEmergencySweepNano))
+	}
+	var grp Group
+	if unsafe.Offsetof(grp.nextTimeNano)%8 != 0 || unsafe.Offsetof(grp.effectiveRate)%8 != 0 ||
+		unsafe.Offsetof(grp.sentBytes)%8 != 0 || unsafe.Offsetof(grp.lastActiveNano)%8 != 0 ||
+		unsafe.Offsetof(grp.rate)%8 != 0 || unsafe.Offsetof(grp.maxLagNano)%8 != 0 ||
+		unsafe.Offsetof(grp.maxHorizonNano)%8 != 0 || unsafe.Offsetof(grp.lastUpdate)%8 != 0 ||
+		unsafe.Offsetof(grp.ackRate)%8 != 0 || unsafe.Offsetof(grp.slots)%8 != 0 {
+		t.Fatalf("Group 64-bit fields are not 8-byte aligned")
+	}
+
+	g := mgr.GetOrCreate(901, 1024) // Below BrutalMinRate; should clamp to BrutalMinRate
+	if g == nil {
+		t.Fatal("expected non-nil group")
+	}
+	if g.GetRate() != BrutalMinRate {
+		t.Fatalf("expected clamped rate %d, got %d", BrutalMinRate, g.GetRate())
+	}
+	if mgr.Len() != 1 {
+		t.Fatalf("expected Len() == 1, got %d", mgr.Len())
+	}
+	// Overflow guard in RecordFeedback
+	g.RecordFeedback(^uint64(0)-10, 5)
+	g.RecordFeedback(100, 100)
+	if g.EffectiveRate() < BrutalMinRate {
+		t.Fatalf("expected valid effective rate after saturating feedback, got %d", g.EffectiveRate())
+	}
+}
+
+func TestSaturatingFeedbackHighBaseRatePreservation(t *testing.T) {
+	mgr := NewGroupManager()
+	defer mgr.Close()
+
+	baseRate := uint64(100 * 1024 * 1024) // 100 MB/s
+	g := mgr.GetOrCreate(999, baseRate)
+	if g == nil {
+		t.Fatal("failed to create group")
+	}
+
+	// Simulate near-MaxUint64 acked count followed by additional acked + lost counts.
+	// Previously total := totalAcked + totalLost wrapped around uint64, collapsing EffectiveRate to BrutalMinRate.
+	g.RecordFeedback(^uint64(0)-10, 5)
+	g.RecordFeedback(100, 100)
+
+	if g.EffectiveRate() < baseRate {
+		t.Fatalf("expected EffectiveRate >= baseRate (%d) after saturating feedback, got %d", baseRate, g.EffectiveRate())
+	}
+}
+
+func TestGroupCancelReservationClampsAtLagFloor(t *testing.T) {
+	mgr := NewGroupManager()
+	defer mgr.Close()
+
+	g := mgr.GetOrCreate(1001, 10*1024*1024)
+	if g == nil {
+		t.Fatal("failed to create group")
+	}
+	now := monotonicNano()
+	_, ok := g.Reserve(now, 1000)
+	if !ok {
+		t.Fatal("expected Reserve to succeed")
+	}
+	// Cancel a much larger byte count than reserved; must clamp at monotonicNano() - lag and never underflow
+	g.CancelReservation(100 * 1024 * 1024)
+	minFloor := monotonicNano() - int64(g.MaxLag()) - int64(5*time.Millisecond)
+	if got := g.nextTimeNano.Load(); got < minFloor {
+		t.Fatalf("expected nextTimeNano (%d) >= lag floor (%d)", got, minFloor)
+	}
 }

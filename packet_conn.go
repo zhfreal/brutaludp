@@ -10,9 +10,18 @@ import (
 )
 
 const (
-	MaxBurstPackets   = 10
-	MinSleepThreshold = 1 * time.Millisecond // Micro-burst smoothing threshold to eliminate timer thrashing
+	MaxBurstPackets                = 10
+	MinSleepThreshold              = 1 * time.Millisecond // Micro-burst smoothing threshold to eliminate timer thrashing
+	DefaultPooledTimerInitDuration = time.Hour            // Initial standby duration before stopping pooled timer
 )
+
+var pacerTimerPool = sync.Pool{
+	New: func() any {
+		t := time.NewTimer(DefaultPooledTimerInitDuration)
+		t.Stop()
+		return t
+	},
+}
 
 // PacedPacketConn wraps net.PacketConn to meter raw UDP datagrams without head-of-line blocking.
 type PacedPacketConn struct {
@@ -23,6 +32,7 @@ type PacedPacketConn struct {
 	net.PacketConn
 	group     *Group
 	closeOnce sync.Once
+	closeChan chan struct{}
 	closed    atomic.Bool
 }
 
@@ -52,9 +62,35 @@ func NewPacedPacketConn(conn net.PacketConn, group *Group) *PacedPacketConn {
 	c := &PacedPacketConn{
 		PacketConn: conn,
 		group:      group,
+		closeChan:  make(chan struct{}),
 	}
 	c.minSleepThresholdNano.Store(int64(MinSleepThreshold))
 	return c
+}
+
+func (c *PacedPacketConn) sleepWithClose(delay time.Duration) error {
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	t := pacerTimerPool.Get().(*time.Timer)
+	t.Reset(delay)
+	select {
+	case <-t.C:
+		pacerTimerPool.Put(t)
+		if c.closed.Load() {
+			return net.ErrClosed
+		}
+		return nil
+	case <-c.closeChan:
+		if !t.Stop() {
+			select {
+			case <-t.C:
+			default:
+			}
+		}
+		pacerTimerPool.Put(t)
+		return net.ErrClosed
+	}
 }
 
 // Upstream exposes the underlying wrapped PacketConn for transparent wrapper inspection.
@@ -138,13 +174,16 @@ func (c *PacedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		}
 		minSleep := c.MinSleepThreshold()
 		if delay >= minSleep {
-			if c.closed.Load() {
-				return 0, net.ErrClosed
+			if err := c.sleepWithClose(delay); err != nil {
+				c.group.CancelReservation(len(p))
+				return 0, err
 			}
-			time.Sleep(delay)
 		}
 	}
 	if c.closed.Load() {
+		if c.group != nil {
+			c.group.CancelReservation(len(p))
+		}
 		return 0, net.ErrClosed
 	}
 	return c.PacketConn.WriteTo(p, addr)
@@ -167,13 +206,16 @@ func (c *PacedPacketConn) Write(p []byte) (int, error) {
 			}
 			minSleep := c.MinSleepThreshold()
 			if delay >= minSleep {
-				if c.closed.Load() {
-					return 0, net.ErrClosed
+				if err := c.sleepWithClose(delay); err != nil {
+					c.group.CancelReservation(len(p))
+					return 0, err
 				}
-				time.Sleep(delay)
 			}
 		}
 		if c.closed.Load() {
+			if c.group != nil {
+				c.group.CancelReservation(len(p))
+			}
 			return 0, net.ErrClosed
 		}
 		return conn.Write(p)
@@ -188,6 +230,9 @@ func (c *PacedPacketConn) Read(p []byte) (int, error) {
 	if c.PacketConn == nil {
 		return 0, net.ErrClosed
 	}
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if r, ok := c.PacketConn.(io.Reader); ok {
 		return r.Read(p)
 	}
@@ -201,6 +246,9 @@ func (c *PacedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	if c.PacketConn == nil {
 		return 0, nil, net.ErrClosed
 	}
+	if len(p) == 0 {
+		return 0, nil, nil
+	}
 	return c.PacketConn.ReadFrom(p)
 }
 
@@ -208,6 +256,9 @@ func (c *PacedPacketConn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
+		if c.closeChan != nil {
+			close(c.closeChan)
+		}
 		if c.group != nil {
 			c.group.Release()
 		}

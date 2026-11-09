@@ -303,19 +303,21 @@ func configureCustomGuardrails() {
 
 ### `Group`
 * `Acquire()` / `Release()`: Atomic reference-counting lifecycle.
-* `OnPacketSent(packetBytes uint64) (delayNano int64, drop bool)`: Hot-path EDT virtual clock progression.
-* `RecordFeedback(ackedCount, lostCount uint64)`: Submits loss and ACK sample counts to the sliding 4s ring buffer.
-* `SetRate(rateBytesPerSec uint64)`: Dynamically reconfigures base pacing rate.
-* `GetRate() uint64` / `EffectiveRate() uint64`: Lock-free inspection of base and compensated pacing rates.
+* `Reserve(nowNano int64, bytes int) (delay time.Duration, ok bool)`: Lock-free CAS reservation on the EDT monotonic virtual clock with anti-OOM forward horizon tail-drop backpressure.
+* `OnPacketSent(now time.Time, bytes int)`: Lock-free post-send byte commitment to the group virtual clock for QUIC/external congestion controllers.
+* `HasPacingBudget(now ...time.Time) bool` / `TimeUntilSend(now ...time.Time) time.Duration`: Lock-free departure budget inspection.
+* `RecordFeedback(ackedCount, lostCount uint64)`: Submits loss and ACK sample counts to the sliding 4s ring buffer with saturating uint64 overflow protection.
+* `SetRate(rateBytesPerSec uint64)`: Dynamically reconfigures base pacing rate (clamped to `BrutalMinRate`).
+* `GetRate() uint64` / `EffectiveRate() uint64`: Lock-free inspection of base and loss-compensated pacing rates.
 * `SetMaxLag(lag time.Duration)` / `MaxLag() time.Duration`: Configures per-group idle burst accumulation ceiling.
 * `SetMaxHorizon(horizon time.Duration)` / `MaxHorizon() time.Duration`: Configures per-group forward scheduling horizon.
-* `SetCwndGain(gain uint32)` / `CwndGain() uint32`: Configures congestion window multiplier in tenths.
+* `SetCwndGain(gain uint32)` / `GetCwndGain() uint32` / `CwndGainVal() uint32`: Configures congestion window multiplier in tenths.
 * `SentBytes() uint64`: Cumulative bytes transmitted through the group.
 
 ### `PacedPacketConn`
-* `NewPacedPacketConn(conn net.PacketConn, group *Group) *PacedPacketConn`: Instantiates the pacing wrapper.
-* `WriteTo(p []byte, addr net.Addr) (int, error)`: Paced transmission to unaddressed endpoints.
-* `Write(p []byte) (int, error)`: Paced transmission for connected UDP sockets.
+* `NewPacedPacketConn(conn net.PacketConn, group *Group) *PacedPacketConn`: Instantiates the pacing wrapper with 8-byte aligned 64-bit atomics and an interruptible `closeChan`.
+* `WriteTo(p []byte, addr net.Addr) (int, error)`: Paced transmission to unaddressed endpoints using pooled `time.Timer` instances (`pacerTimerPool`) that wake immediately with `net.ErrClosed` if `Close()` is called during a pacing sleep.
+* `Write(p []byte) (int, error)`: Paced transmission for connected UDP sockets with immediate `Close()` interruption.
 * `SetMinSleepThreshold(threshold time.Duration)`: Configures the micro-burst sleep smoothing floor.
 * `DroppedPackets() uint64`: Telemetry reporting datagrams dropped due to forward horizon saturation.
 * `Upstream() any`: Returns underlying unwrapped `net.PacketConn`.

@@ -39,6 +39,13 @@ func monotonicNano() int64 {
 	return time.Since(startTime).Nanoseconds()
 }
 
+func addUint64Sat(a, b uint64) uint64 {
+	if ^uint64(0)-a < b {
+		return ^uint64(0)
+	}
+	return a + b
+}
+
 type PktSlot struct {
 	sec    int64
 	acked  uint64
@@ -60,18 +67,19 @@ type Group struct {
 	ID             uint64
 	Rate           uint64        // Configured bytes per second (cached field for compatibility)
 
+	lastUpdate int64
+	ackRate    float64
+	slots      [PktInfoSlots]PktSlot
+
 	// 4-byte and smaller fields
 	CwndGain                atomic.Uint32 // CWND gain in tenths (20 = 2.0x, lock-free)
 	refCount                atomic.Int32  // Active connection reference counter
 	disableLossComp         atomic.Bool   // Thread-safe lock-free toggle for loss compensation
 	DisableLossCompensation bool          // Cached field for compatibility
 
-	// Structs, pointers, and mutex (used ONLY for infrequent feedback/rate updates, NEVER on pacing hot path)
-	manager    *GroupManager
-	mu         sync.Mutex
-	slots      [PktInfoSlots]PktSlot
-	ackRate    float64
-	lastUpdate int64
+	// Pointers and mutex (used ONLY for infrequent feedback/rate updates, NEVER on pacing hot path)
+	manager *GroupManager
+	mu      sync.Mutex
 }
 
 func NewGroup(id uint64, rateBytesPerSec uint64, cwndGain uint32, manager *GroupManager) *Group {
@@ -133,6 +141,11 @@ func (g *Group) Release() {
 
 // GetCwndGain locklessly returns the configured CWND gain factor.
 func (g *Group) GetCwndGain() uint32 {
+	return g.CwndGain.Load()
+}
+
+// CwndGainGroup returns the configured CWND gain factor.
+func (g *Group) CwndGainVal() uint32 {
 	return g.CwndGain.Load()
 }
 
@@ -310,6 +323,50 @@ func (g *Group) Reserve(nowNano int64, bytes int) (delay time.Duration, ok bool)
 	}
 }
 
+// CancelReservation refunds a previously reserved packet slot when a sleeping writer is aborted by Close().
+// This prevents phantom pacing debt and SentBytes inflation on shared Group instances.
+func (g *Group) CancelReservation(bytes int) {
+	if bytes <= 0 {
+		return
+	}
+	if bytes > MaxSafePacketBytes {
+		bytes = MaxSafePacketBytes
+	}
+	effBps := g.effectiveRate.Load()
+	if effBps < BrutalMinRate {
+		effBps = BrutalMinRate
+	}
+	burstDuration := (int64(bytes) * NanosPerSecond) / int64(effBps)
+	nowNano := monotonicNano()
+	lag := g.maxLagNano.Load()
+	if lag <= 0 {
+		lag = int64(GroupMaxLag)
+	}
+	minStart := nowNano - lag
+	for {
+		cur := g.nextTimeNano.Load()
+		rewound := cur - burstDuration
+		if rewound < minStart {
+			rewound = minStart
+		}
+		if g.nextTimeNano.CompareAndSwap(cur, rewound) {
+			break
+		}
+	}
+	for {
+		cur := g.sentBytes.Load()
+		if cur < uint64(bytes) {
+			if g.sentBytes.CompareAndSwap(cur, 0) {
+				break
+			}
+			continue
+		}
+		if g.sentBytes.CompareAndSwap(cur, cur-uint64(bytes)) {
+			break
+		}
+	}
+}
+
 // OnPacketSent locklessly commits transmitted bytes to the group virtual clock using an atomic CompareAndSwap loop.
 // Note: It respects GroupMaxLag to cap idle burst credits, but does NOT forward-clamp start down to maxStart,
 // preventing rate debt forgiveness and unmetered transmission overruns during bursts.
@@ -368,8 +425,8 @@ func (g *Group) RecordFeedback(acked, lost uint64) {
 	slotIdx := sec & (PktInfoSlots - 1)
 
 	if g.slots[slotIdx].sec == sec {
-		g.slots[slotIdx].acked += acked
-		g.slots[slotIdx].losses += lost
+		g.slots[slotIdx].acked = addUint64Sat(g.slots[slotIdx].acked, acked)
+		g.slots[slotIdx].losses = addUint64Sat(g.slots[slotIdx].losses, lost)
 	} else {
 		g.slots[slotIdx].sec = sec
 		g.slots[slotIdx].acked = acked
@@ -379,20 +436,29 @@ func (g *Group) RecordFeedback(acked, lost uint64) {
 	var totalAcked, totalLost uint64
 	for i := 0; i < PktInfoSlots; i++ {
 		if g.slots[i].sec > sec-int64(PktInfoSlots) && g.slots[i].sec <= sec {
-			totalAcked += g.slots[i].acked
-			totalLost += g.slots[i].losses
+			totalAcked = addUint64Sat(totalAcked, g.slots[i].acked)
+			totalLost = addUint64Sat(totalLost, g.slots[i].losses)
 		}
 	}
-	total := totalAcked + totalLost
+	total := addUint64Sat(totalAcked, totalLost)
 	if total < MinFeedbackSlots {
 		if g.ackRate == DefaultAckRate {
 			return
 		}
 		g.ackRate = DefaultAckRate
 	} else {
-		rate := float64(totalAcked) / float64(total)
+		var rate float64
+		if ^uint64(0)-totalAcked < totalLost {
+			halfAcked := totalAcked >> 1
+			halfLost := totalLost >> 1
+			rate = float64(halfAcked) / float64(halfAcked+halfLost)
+		} else {
+			rate = float64(totalAcked) / float64(total)
+		}
 		if rate < MinAckRate {
 			rate = MinAckRate
+		} else if rate > DefaultAckRate {
+			rate = DefaultAckRate
 		}
 		if rate == g.ackRate {
 			return
@@ -408,17 +474,26 @@ func (g *Group) RecordFeedback(acked, lost uint64) {
 }
 
 // GroupManager provides thread-safe group retrieval, active idle cleanup, automated background reaping, and map compaction.
+// All 64-bit atomic fields are placed first (offset 0) to guarantee 8-byte alignment on 32-bit architectures (ARMv7, MIPS, 386).
 type GroupManager struct {
-	mu                     sync.Mutex
-	groups                 map[uint64]*Group
-	deletedCount           int
-	lastEmergencySweepNano int64
-	janitorRunning         atomic.Bool
-	janitorDone            chan struct{}
-	maxGroups              int
-	idleTTL                time.Duration
 	defaultMaxLag          atomic.Int64
 	defaultMaxHorizon      atomic.Int64
+	lastEmergencySweepNano atomic.Int64
+
+	mu             sync.Mutex
+	groups         map[uint64]*Group
+	deletedCount   int
+	janitorRunning atomic.Bool
+	janitorDone    chan struct{}
+	maxGroups      int
+	idleTTL        time.Duration
+}
+
+// Len returns the number of currently tracked groups in the manager.
+func (m *GroupManager) Len() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.groups)
 }
 
 // SetMaxGroups sets the maximum number of concurrent groups allowed before emergency cleanup.
@@ -455,10 +530,15 @@ var DefaultManager = &GroupManager{
 	groups: make(map[uint64]*Group),
 }
 
-// NewGroupManager creates an independent GroupManager instance.
-func NewGroupManager() *GroupManager {
+// NewGroupManager creates an independent GroupManager instance with an optional custom idle retention TTL.
+func NewGroupManager(idleTTL ...time.Duration) *GroupManager {
+	var ttl time.Duration
+	if len(idleTTL) > 0 && idleTTL[0] > 0 {
+		ttl = idleTTL[0]
+	}
 	return &GroupManager{
-		groups: make(map[uint64]*Group),
+		groups:  make(map[uint64]*Group),
+		idleTTL: ttl,
 	}
 }
 
@@ -472,6 +552,13 @@ func (m *GroupManager) compactLocked() {
 }
 
 func (m *GroupManager) cleanupIdleLocked(idleLimit int64) int {
+	if idleLimit < 0 {
+		if m.idleTTL > 0 {
+			idleLimit = int64(m.idleTTL)
+		} else {
+			idleLimit = int64(DefaultIdleTTL)
+		}
+	}
 	nowNano := monotonicNano()
 	evicted := 0
 	for id, g := range m.groups {
@@ -511,8 +598,14 @@ func (m *GroupManager) GetOrCreate(id uint64, rate uint64, cwndGain ...uint32) *
 	if g, ok := m.groups[id]; ok {
 		g.Acquire()
 		g.lastActiveNano.Store(monotonicNano())
-		if rate > 0 && rate != g.rate.Load() {
-			g.SetRate(rate)
+		if rate > 0 {
+			clampedRate := rate
+			if clampedRate < BrutalMinRate {
+				clampedRate = BrutalMinRate
+			}
+			if clampedRate != g.rate.Load() {
+				g.SetRate(clampedRate)
+			}
 		}
 		if len(cwndGain) > 0 && cwndGain[0] > 0 && cwndGain[0] != g.GetCwndGain() {
 			g.SetCwndGain(cwndGain[0])
@@ -527,8 +620,9 @@ func (m *GroupManager) GetOrCreate(id uint64, rate uint64, cwndGain ...uint32) *
 	}
 	if len(m.groups) >= maxGroups {
 		nowNano := monotonicNano()
-		if nowNano-m.lastEmergencySweepNano >= int64(EmergencySweepMinInterval) {
-			m.lastEmergencySweepNano = nowNano
+		lastSweep := m.lastEmergencySweepNano.Load()
+		if nowNano-lastSweep >= int64(EmergencySweepMinInterval) {
+			m.lastEmergencySweepNano.Store(nowNano)
 			m.cleanupIdleLocked(0) // Throttled emergency sweep of unreferenced groups
 		}
 		if len(m.groups) >= maxGroups {
@@ -576,12 +670,6 @@ func (m *GroupManager) StartJanitor(interval, maxIdle time.Duration) {
 	if interval <= 0 {
 		interval = DefaultJanitorInterval
 	}
-	if maxIdle <= 0 {
-		maxIdle = m.idleTTL
-		if maxIdle <= 0 {
-			maxIdle = DefaultIdleTTL
-		}
-	}
 	m.janitorRunning.Store(true)
 	done := make(chan struct{})
 	m.janitorDone = done
@@ -593,7 +681,11 @@ func (m *GroupManager) StartJanitor(interval, maxIdle time.Duration) {
 		for {
 			select {
 			case <-ticker.C:
-				m.CleanupIdle(maxIdle)
+				limit := maxIdle
+				if limit <= 0 {
+					limit = -1 // Resolve m.idleTTL dynamically under lock in cleanupIdleLocked
+				}
+				m.CleanupIdle(limit)
 			case <-done:
 				return
 			}
